@@ -1,0 +1,21 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      # 跳过启动时自动安装依赖（本工作流显式安装核心依赖，可选依赖由测试自行跳过）
+      DEEPSEEK_SKIP_BOOTSTRAP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install openai "pydantic>=2.0,<3.0" requests beautifulsoup4 PyYAML tokenizers pytest
+      - run: python -m pytest tests/ -q
+      - run: python -m py_compile neo_code.py

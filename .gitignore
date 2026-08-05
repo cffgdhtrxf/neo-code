@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# 工具缓存
+.codegraph/
+.omo/
+.qoder/
+
+# 运行产物
+output/
+temp/
+save/
+
+# 备份文件
+*.bak
+
+# 本地参考资料（50MB+，含第三方内容与旧版密钥，不随仓库发布）
+archive/

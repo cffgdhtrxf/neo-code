@@ -1,0 +1,45 @@
+[project]
+name = "neo-code"
+version = "1.1.0"
+description = "DeepSeek V4 API interactive CLI with safety-gated tool calling and vector memory"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Neo Code contributors" }]
+keywords = ["deepseek", "cli", "llm", "agent", "chat"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+dependencies = [
+    "openai>=1.0,<2.0",
+    "pydantic>=2.0,<3.0",
+    "requests>=2.28",
+    "beautifulsoup4",
+    "PyYAML",
+]
+
+[project.urls]
+Repository = "https://github.com/cffgdhtrxf/neo-code"
+
+[project.scripts]
+neo_code = "neo_code:main"
+
+[project.optional-dependencies]
+vector = [
+    "chromadb",
+    "sentence-transformers",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["neo_code"]

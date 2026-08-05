@@ -19,5 +19,8 @@ save/
 # 备份文件
 *.bak
 
+# 本地素材（开屏已内嵌进 neo_code.py，脚本仅作参考保留）
+neo_code_banner*.py
+
 # 本地参考资料（50MB+，含第三方内容与旧版密钥，不随仓库发布）
 archive/

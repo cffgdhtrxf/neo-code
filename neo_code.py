@@ -424,6 +424,7 @@ import socket
 import shlex
 import tempfile
 import urllib.parse
+import urllib3.util  # 与 requests 使用同一 URL 解析器，避免校验器/连接器解析分歧
 import xml.etree.ElementTree
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -925,17 +926,49 @@ def _parse_ip(addr: str):
 def _ip_is_blocked(ip) -> bool:
     return any(ip in net for net in _BLOCKED_NETWORKS)
 
+def _url_host(url: str) -> Optional[str]:
+    """取 URL 主机名。刻意使用 urllib3（requests 内部同一解析器）而非 urlsplit：
+    两者对反斜杠等字符的解释不同（urllib3 按 WHATWG 先把 `\\` 归一为 `/`），
+    混用会让校验器看到的 host 与实际连接的 host 不一致而可被绕过。"""
+    try:
+        host = urllib3.util.parse_url(url).host
+    except Exception:
+        return None
+    if not host:
+        return None
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]  # urllib3 保留 IPv6 方括号
+    return host or None
+
+def _same_origin(a: str, b: str) -> bool:
+    """两个 URL 是否同源（同样用 urllib3 判断）。解析失败视为不同源，更保守。"""
+    try:
+        pa = urllib3.util.parse_url(a)
+        pb = urllib3.util.parse_url(b)
+    except Exception:
+        return False
+    if not pa.host or not pb.host:
+        return False
+    return (pa.scheme, pa.host.lower(), pa.port) == (pb.scheme, pb.host.lower(), pb.port)
+
 def validate_fetch_url(url: str) -> Optional[str]:
     """校验出站 URL：仅允许 http/https，且目标不得落在私网/回环/保留地址。
     通过返回 None，否则返回拦截原因字符串。
     注意：域名解析与正式连接之间存在 DNS rebinding 窗口，这里是尽力而为的校验。"""
+    if not isinstance(url, str):
+        return "invalid URL"
+    # 反斜杠与控制字符：客户端会先行归一（`\\` 视作 `/`，并忽略控制字符），
+    # 使校验器看到的主机与实际连接的主机不同。RFC 3986 中二者本就不合法，直接拒绝。
+    if "\\" in url or any(ord(c) < 0x20 or ord(c) == 0x7f for c in url):
+        return "URL contains backslash or control characters"
     try:
         parsed = urllib.parse.urlsplit(url)
     except ValueError:
         return "invalid URL"
     if parsed.scheme not in ("http", "https"):
         return f"scheme '{parsed.scheme or '(none)'}' not allowed (only http/https)"
-    host = (parsed.hostname or "").strip()
+    host = _url_host(url)
     if not host:
         return "missing host"
     if host.lower() == "localhost" or host.lower().endswith(".localhost"):
@@ -970,7 +1003,12 @@ def safe_get(url: str, headers: Optional[dict] = None, timeout: int = 15,
         if not location:
             return resp
         resp.close()  # 该跳响应不再使用，归还连接
-        current = urllib.parse.urljoin(current, location)
+        nxt = urllib.parse.urljoin(current, location)
+        if headers and not _same_origin(current, nxt):
+            # 跨源跳转剔除凭证类头（对齐 requests 原生 allow_redirects 的行为）
+            headers = {k: v for k, v in headers.items()
+                       if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+        current = nxt
     raise TooManyRedirectsError(f"too many redirects (>{max_redirects})")
 
 def cached_fetch(state: SessionState, url: str) -> str:
@@ -3524,7 +3562,9 @@ def tool_process(state: SessionState, action: str = "", command: str = "", sessi
 
     elif action == "send_keys":
         if not session_id or not keys: return "Error: session_id and keys required"
-        # 与 action=start 同一道门禁：keys 会写进已启动 shell 的 stdin，等价于执行命令
+        # 与 action=start 同一道门禁：keys 会写进已启动 shell 的 stdin，等价于执行命令。
+        # 注意：按键是流式写入的，拆成多次发送（如先 "rm -rf " 再 "/"）可绕过该启发式，
+        # 与 tool_run_command 的同类限制一致——此处是纵深防御，不是完备的隔离。
         for pattern, warning in DESTRUCTIVE_PATTERNS:
             if pattern.search(keys):
                 return f"Error: blocked destructive command: {warning}"

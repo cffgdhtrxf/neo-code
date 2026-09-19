@@ -958,6 +958,7 @@ def safe_get(url: str, headers: Optional[dict] = None, timeout: int = 15,
         location = resp.headers.get("Location")
         if not location:
             return resp
+        resp.close()  # 该跳响应不再使用，归还连接
         current = urllib.parse.urljoin(current, location)
     raise BlockedUrlError(f"too many redirects (>{max_redirects})")
 
@@ -3512,6 +3513,10 @@ def tool_process(state: SessionState, action: str = "", command: str = "", sessi
 
     elif action == "send_keys":
         if not session_id or not keys: return "Error: session_id and keys required"
+        # 与 action=start 同一道门禁：keys 会写进已启动 shell 的 stdin，等价于执行命令
+        for pattern, warning in DESTRUCTIVE_PATTERNS:
+            if pattern.search(keys):
+                return f"Error: blocked destructive command: {warning}"
         with _process_lock: info = _process_registry.get(session_id)
         if not info or info.get("status") != "running":
             return f"Process '{session_id}' not running (status: {info.get('status','?') if info else 'not found'})"

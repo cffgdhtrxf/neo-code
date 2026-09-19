@@ -878,17 +878,26 @@ _BLOCKED_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
     "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
     "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
     "240.0.0.0/4", "255.255.255.255/32",
-    "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "2002::/16", "2001::/32",
+    "::/128", "::1/128", "::/96", "::ffff:0:0/96", "64:ff9b::/96", "2002::/16", "2001::/32",
     "fc00::/7", "fe80::/10", "ff00::/8",
 ))
 
 class BlockedUrlError(Exception):
     """URL 被出站安全策略拦截（非 http/https，或指向私网/回环/保留地址）。"""
+    default_hint = "仅允许公网 http/https URL；内网/回环地址已被拦截"
+
+    def __init__(self, reason: str, hint: Optional[str] = None):
+        super().__init__(reason)
+        self.hint = hint or self.default_hint
+
+class TooManyRedirectsError(BlockedUrlError):
+    """重定向跳数超过上限——拦截原因不是内网地址，需给出不同提示。"""
+    default_hint = "重定向次数超过上限，请改用最终 URL 直接请求"
 
 def _parse_ip(addr: str):
     """解析主机字面量，并归一化等价写法，避免绕过网段黑名单：
     IPv4-mapped IPv6（`::ffff:127.0.0.1`）归一为 IPv4；整数形式（`2130706433`、
-    `0x7f000001`）按整数解析。无法解析返回 None。"""
+    `0x7f000001`、`017700000001`）按对应进制解析。无法解析返回 None。"""
     s = addr.split('%', 1)[0].strip()
     if not s:
         return None
@@ -897,10 +906,12 @@ def _parse_ip(addr: str):
     except ValueError:
         if s.lower().startswith("0x"):
             base = 16
+        elif s.lower().startswith("0o"):
+            base = 8
+        elif len(s) > 1 and s[0] == "0" and all(c in "01234567" for c in s):
+            base = 8  # 前导零按 inet_aton 语义视为八进制（须先于 isdigit 判断）
         elif s.isdigit():
             base = 10
-        elif len(s) > 1 and s[0] == "0":
-            base = 8
         else:
             return None
         try:
@@ -960,7 +971,7 @@ def safe_get(url: str, headers: Optional[dict] = None, timeout: int = 15,
             return resp
         resp.close()  # 该跳响应不再使用，归还连接
         current = urllib.parse.urljoin(current, location)
-    raise BlockedUrlError(f"too many redirects (>{max_redirects})")
+    raise TooManyRedirectsError(f"too many redirects (>{max_redirects})")
 
 def cached_fetch(state: SessionState, url: str) -> str:
     now = time.time()
@@ -2653,7 +2664,7 @@ def tool_web_fetch(state: SessionState, url: str, raw: bool = False) -> str:
         text = re.sub(r'\s+', ' ', text).strip()
         return _mark_external_content(truncate_output(text, max_len=6000), url)
     except BlockedUrlError as e:
-        return _tool_failure("blocked", str(e), "仅允许公网 http/https URL；内网/回环地址已被拦截")
+        return _tool_failure("blocked", str(e), e.hint)
     except Exception as e:
         return _tool_failure("network", str(e), "检查网络连接与 URL")
 
@@ -2681,7 +2692,7 @@ def tool_read_webpage(state: SessionState, url: str) -> str:
         except ImportError:
             return tool_web_fetch(state, url, raw=False)
     except BlockedUrlError as e:
-        return _tool_failure("blocked", str(e), "仅允许公网 http/https URL；内网/回环地址已被拦截")
+        return _tool_failure("blocked", str(e), e.hint)
     except Exception as e:
         return _tool_failure("network", str(e), "检查网络连接与 URL")
 
@@ -3368,7 +3379,7 @@ def tool_social_fetch(state: SessionState, url: str = "", max_length: int = 5000
             return f"Error: RSS fetch failed (status {resp.status_code})"
         return f"Unsupported URL. Use web_extract: web_extract(urls=['{url}'])"
     except BlockedUrlError as e:
-        return _tool_failure("blocked", str(e), "仅允许公网 http/https URL；内网/回环地址已被拦截")
+        return _tool_failure("blocked", str(e), e.hint)
     except requests.RequestException as e:
         return _tool_failure("network", str(e), "检查 URL/网络；RSS 可用 web_fetch 代替")
 

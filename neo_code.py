@@ -878,17 +878,40 @@ _BLOCKED_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
     "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
     "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
     "240.0.0.0/4", "255.255.255.255/32",
-    "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+    "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "2002::/16", "2001::/32",
+    "fc00::/7", "fe80::/10", "ff00::/8",
 ))
 
 class BlockedUrlError(Exception):
     """URL 被出站安全策略拦截（非 http/https，或指向私网/回环/保留地址）。"""
 
-def _is_blocked_address(addr: str) -> bool:
+def _parse_ip(addr: str):
+    """解析主机字面量，并归一化等价写法，避免绕过网段黑名单：
+    IPv4-mapped IPv6（`::ffff:127.0.0.1`）归一为 IPv4；整数形式（`2130706433`、
+    `0x7f000001`）按整数解析。无法解析返回 None。"""
+    s = addr.split('%', 1)[0].strip()
+    if not s:
+        return None
     try:
-        ip = ipaddress.ip_address(addr.split('%', 1)[0])
+        ip = ipaddress.ip_address(s)
     except ValueError:
-        return True
+        if s.lower().startswith("0x"):
+            base = 16
+        elif s.isdigit():
+            base = 10
+        elif len(s) > 1 and s[0] == "0":
+            base = 8
+        else:
+            return None
+        try:
+            ip = ipaddress.ip_address(int(s, base))
+        except ValueError:
+            return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+def _ip_is_blocked(ip) -> bool:
     return any(ip in net for net in _BLOCKED_NETWORKS)
 
 def validate_fetch_url(url: str) -> Optional[str]:
@@ -906,19 +929,19 @@ def validate_fetch_url(url: str) -> Optional[str]:
         return "missing host"
     if host.lower() == "localhost" or host.lower().endswith(".localhost"):
         return f"host '{host}' is loopback"
-    try:
-        ipaddress.ip_address(host.split('%', 1)[0])
-    except ValueError:
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            return None  # 解析失败交由 requests 报网络错误
-        addrs = {i[4][0] for i in infos}
-        if addrs and any(_is_blocked_address(a) for a in addrs):
-            return f"host '{host}' resolves to a private/loopback address"
+    literal = _parse_ip(host)
+    if literal is not None:
+        if _ip_is_blocked(literal):
+            return f"address '{host}' is private/loopback/reserved"
         return None
-    if _is_blocked_address(host):
-        return f"address '{host}' is private/loopback/reserved"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return None  # 解析失败交由 requests 报网络错误
+    for info in infos:
+        resolved = _parse_ip(str(info[4][0]))
+        if resolved is None or _ip_is_blocked(resolved):
+            return f"host '{host}' resolves to a private/loopback address"
     return None
 
 def safe_get(url: str, headers: Optional[dict] = None, timeout: int = 15,

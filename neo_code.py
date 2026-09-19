@@ -419,9 +419,11 @@ import subprocess
 import difflib
 import argparse
 import atexit
+import ipaddress
 import socket
 import shlex
 import tempfile
+import urllib.parse
 import xml.etree.ElementTree
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -870,15 +872,80 @@ def cached_read(state: SessionState, path: Path) -> str:
     state.file_cache[str(p)] = (mtime, content)
     return content
 
+# ── 出站 URL 安全校验（SSRF 防护）──
+_BLOCKED_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
+    "240.0.0.0/4", "255.255.255.255/32",
+    "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+))
+
+class BlockedUrlError(Exception):
+    """URL 被出站安全策略拦截（非 http/https，或指向私网/回环/保留地址）。"""
+
+def _is_blocked_address(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.split('%', 1)[0])
+    except ValueError:
+        return True
+    return any(ip in net for net in _BLOCKED_NETWORKS)
+
+def validate_fetch_url(url: str) -> Optional[str]:
+    """校验出站 URL：仅允许 http/https，且目标不得落在私网/回环/保留地址。
+    通过返回 None，否则返回拦截原因字符串。
+    注意：域名解析与正式连接之间存在 DNS rebinding 窗口，这里是尽力而为的校验。"""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "invalid URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"scheme '{parsed.scheme or '(none)'}' not allowed (only http/https)"
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return "missing host"
+    if host.lower() == "localhost" or host.lower().endswith(".localhost"):
+        return f"host '{host}' is loopback"
+    try:
+        ipaddress.ip_address(host.split('%', 1)[0])
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return None  # 解析失败交由 requests 报网络错误
+        addrs = {i[4][0] for i in infos}
+        if addrs and any(_is_blocked_address(a) for a in addrs):
+            return f"host '{host}' resolves to a private/loopback address"
+        return None
+    if _is_blocked_address(host):
+        return f"address '{host}' is private/loopback/reserved"
+    return None
+
+def safe_get(url: str, headers: Optional[dict] = None, timeout: int = 15,
+             allow_redirects: bool = True, max_redirects: int = 5):
+    """SSRF 防护版 requests.get：逐跳校验重定向目标，检查不通过时不发出请求。"""
+    current = url
+    for _ in range(max_redirects + 1):
+        reason = validate_fetch_url(current)
+        if reason:
+            raise BlockedUrlError(reason)
+        resp = requests.get(current, headers=headers, timeout=timeout, allow_redirects=False)
+        if not allow_redirects or resp.status_code not in (301, 302, 303, 307, 308):
+            return resp
+        location = resp.headers.get("Location")
+        if not location:
+            return resp
+        current = urllib.parse.urljoin(current, location)
+    raise BlockedUrlError(f"too many redirects (>{max_redirects})")
+
 def cached_fetch(state: SessionState, url: str) -> str:
     now = time.time()
     if url in state.url_cache:
         entry = state.url_cache[url]
         if now - entry["ts"] < 300:
             return entry["content"]
-    import requests
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-CLI/1.0"}
-    resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+    resp = safe_get(url, headers=headers, timeout=15)
     content = resp.text
     state.url_cache[url] = {"content": content, "ts": now}
     return content
@@ -2121,8 +2188,9 @@ def tool_run_command(state: SessionState, command: str, cwd: Optional[str] = Non
     if run_in_background:
         try:
             _enc = "utf-8"  # CLI 输出契约是 UTF-8，子进程输出按 UTF-8 解码
-            log_path = Path(tempfile.gettempdir()) / f"deepseek_bg_{int(time.time()*1000)}.log"
-            log_fd = open(str(log_path), 'w', encoding='utf-8')
+            log_fd_raw, log_name = tempfile.mkstemp(prefix="deepseek_bg_", suffix=".log")
+            log_path = Path(log_name)
+            log_fd = os.fdopen(log_fd_raw, 'w', encoding='utf-8')
             proc = subprocess.Popen(
                 shell_cmd, stdout=log_fd, stderr=subprocess.STDOUT,
                 cwd=str(work_dir), env=env_merged,
@@ -2548,10 +2616,9 @@ class WebFetchArgs(BaseModel):
 
 @register_tool("web_fetch", "获取单个网页内容（纯文本或原始 HTML）。Use when: 需要具体网页正文。Don't use: 只要搜索结果（web_search）；多 URL 提取（web_extract）。单页，15s 超时，返回已做来源标记。", WebFetchArgs)
 def tool_web_fetch(state: SessionState, url: str, raw: bool = False) -> str:
-    import requests
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-CLI/1.0"}
     try:
-        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        resp = safe_get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
             return _tool_failure("http", f"HTTP {resp.status_code}", "检查 URL 或稍后重试；也可用 read_webpage/web_extract")
         if raw:
@@ -2561,6 +2628,8 @@ def tool_web_fetch(state: SessionState, url: str, raw: bool = False) -> str:
         text = re.sub(r'<[^>]+>', ' ', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return _mark_external_content(truncate_output(text, max_len=6000), url)
+    except BlockedUrlError as e:
+        return _tool_failure("blocked", str(e), "仅允许公网 http/https URL；内网/回环地址已被拦截")
     except Exception as e:
         return _tool_failure("network", str(e), "检查网络连接与 URL")
 
@@ -2571,10 +2640,9 @@ class ReadWebpageArgs(BaseModel):
 
 @register_tool("read_webpage", "智能提取网页正文（去导航/脚本/页脚）。Use when: 需要干净正文。Don't use: 原始 HTML（web_fetch raw=True）或多 URL（web_extract）。边界: 单页。返回已做来源标记。", ReadWebpageArgs)
 def tool_read_webpage(state: SessionState, url: str) -> str:
-    import requests
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-CLI/1.0"}
     try:
-        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        resp = safe_get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
             return _tool_failure("http", f"HTTP {resp.status_code}", "检查 URL 或稍后重试；也可用 web_fetch")
         try:
@@ -2588,6 +2656,8 @@ def tool_read_webpage(state: SessionState, url: str) -> str:
             return _mark_external_content(truncate_output("\n".join(lines), max_len=6000), url)
         except ImportError:
             return tool_web_fetch(state, url, raw=False)
+    except BlockedUrlError as e:
+        return _tool_failure("blocked", str(e), "仅允许公网 http/https URL；内网/回环地址已被拦截")
     except Exception as e:
         return _tool_failure("network", str(e), "检查网络连接与 URL")
 
@@ -3249,19 +3319,19 @@ def tool_social_fetch(state: SessionState, url: str = "", max_length: int = 5000
     try:
         if "twitter.com" in url or "x.com" in url:
             nitter_url = url.replace("twitter.com", "nitter.net").replace("x.com", "nitter.net")
-            resp = requests.get(nitter_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp = safe_get(nitter_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
                 return _mark_external_content(truncate_output(resp.text[:max_length], max_len=max_length), url)
             return f"Error: could not fetch via Nitter (status {resp.status_code})"
         if "bilibili.com" in url or "b23.tv" in url:
-            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+            resp = safe_get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
             if resp.status_code == 200:
                 return _mark_external_content(truncate_output(resp.text[:max_length], max_len=max_length), url)
             return f"Error: Bilibili fetch failed (status {resp.status_code})"
         if "youtube.com" in url or "youtu.be" in url:
             return f"YouTube URL. Use web_extract: web_extract(urls=['{url}'])"
         if url.endswith((".rss", ".xml")) or "feed" in url.lower():
-            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp = safe_get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
                 try:
                     import xml.etree.ElementTree as ET
@@ -3273,6 +3343,8 @@ def tool_social_fetch(state: SessionState, url: str = "", max_length: int = 5000
                     return _mark_external_content(truncate_output(resp.text[:max_length], max_len=max_length), url)
             return f"Error: RSS fetch failed (status {resp.status_code})"
         return f"Unsupported URL. Use web_extract: web_extract(urls=['{url}'])"
+    except BlockedUrlError as e:
+        return _tool_failure("blocked", str(e), "仅允许公网 http/https URL；内网/回环地址已被拦截")
     except requests.RequestException as e:
         return _tool_failure("network", str(e), "检查 URL/网络；RSS 可用 web_fetch 代替")
 
@@ -3305,11 +3377,17 @@ def tool_process(state: SessionState, action: str = "", command: str = "", sessi
         _process_counter += 1; sid = session_id or f"term_{_process_counter}"
         wd = normalize_path(workdir) if workdir else None
         if wd and not wd.is_dir(): return f"Error: workdir not found: {wd}"
+        if wd:
+            _clamp_err = _enforce_path_clamp(wd)
+            if _clamp_err: return f"Error: {_clamp_err}"
+        for pattern, warning in DESTRUCTIVE_PATTERNS:
+            if pattern.search(command):
+                return f"Error: blocked destructive command: {warning}"
         try:
             proc = subprocess.Popen(
-                command, shell=True,
+                build_shell_command(command),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=0,
+                text=True, encoding="utf-8", errors="replace", bufsize=0,
                 cwd=str(wd) if wd else None,
                 creationflags=0x08000000 if sys.platform == "win32" else 0,
             )
